@@ -1,0 +1,133 @@
+name: Story status
+on:
+  push:
+    branches: ['story/**']
+
+permissions:
+  contents: read
+
+env:
+  PROJECT_TITLE: ai-sdlc-pilot
+  STATUS_FIELD: Status
+  TARGET_STATUS: In progress
+
+jobs:
+  set-in-progress:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      # Deliberate: checkout + lookup run before the script's cheap guards —
+      # fail-loud on board misconfiguration beats silent skips (~10s per run).
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/project-lookup
+        with:
+          gh-token: ${{ secrets.PROJECT_TOKEN }}
+          owner: ${{ github.repository_owner }}
+          project-title: ${{ env.PROJECT_TITLE }}
+          status-field: ${{ env.STATUS_FIELD }}
+          target-status: ${{ env.TARGET_STATUS }}
+      - name: Move story item to In progress
+        env:
+          GH_TOKEN: ${{ secrets.PROJECT_TOKEN }}
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          set -euo pipefail
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "::warning::PROJECT_TOKEN secret not set — board status NOT updated; branch push did not move the card to In progress"
+            echo "⚠️ PROJECT_TOKEN secret not set — board status not updated"; exit 0
+          fi
+          NUM="${GITHUB_REF_NAME#story/}"; NUM="${NUM%%-*}"
+          if [ -z "$NUM" ]; then
+            echo "::error::branch '$GITHUB_REF_NAME' matches story/* but has no issue number"; exit 1
+          fi
+          if ! [[ "$NUM" =~ ^[0-9]+$ ]]; then
+            echo "::error::branch '$GITHUB_REF_NAME' — expected format 'story/<issue#>-slug', got '$NUM' as issue number"; exit 1
+          fi
+          NUM=$((10#$NUM))  # normalize zero-padded numbers for --argjson/-F
+          REPO_NAME="${GITHUB_REPOSITORY#*/}"
+          gql() {
+            local out
+            if ! out=$(gh api graphql "$@"); then
+              echo "::error::gh api graphql failed"; return 1
+            fi
+            if ! jq -e '(.errors // []) | length == 0' >/dev/null <<<"$out"; then
+              echo "::error::GraphQL errors: $(jq -c '.errors' <<<"$out")"; return 1
+            fi
+            printf '%s' "$out"
+          }
+          # The issue first: a closed story's lifecycle is complete — board
+          # automation never writes its card again, whatever a stray branch push
+          # does. Checked BEFORE the PR fast path so the skip reason is unambiguous.
+          RES=$(gql -F n="$NUM" -f query='
+            query($o: String!, $r: String!, $n: Int!) {
+              repository(owner: $o, name: $r) {
+                issue(number: $n) {
+                  id state
+                  projectItems(first: 50) {
+                    nodes {
+                      id
+                      project { title }
+                      fieldValues(first: 10) {
+                        nodes { ... on ProjectV2ItemFieldSingleSelectValue { name field { ... on ProjectV2SingleSelectField { name } } } }
+                      }
+                    }
+                  }
+                }
+              }
+            }' -f o="$OWNER" -f r="$REPO_NAME")
+          if [ "$(jq -r '.data.repository.issue.id' <<<"$RES")" = "null" ]; then
+            echo "::error::branch '$GITHUB_REF_NAME' references issue #$NUM, which does not exist"; exit 1
+          fi
+          if [ "$(jq -r '.data.repository.issue.state' <<<"$RES")" != "OPEN" ]; then
+            echo "issue #$NUM is closed — story lifecycle complete; ignoring push to '$GITHUB_REF_NAME'"; exit 0
+          fi
+          # Fast path (open stories only): a non-draft PR already open for this
+          # branch means the card is (or will be) In review — leave it alone.
+          OPEN_PRS=$(gh pr list -R "$GITHUB_REPOSITORY" --head "$GITHUB_REF_NAME" --state open --json number,isDraft --jq '[.[] | select(.isDraft == false)] | length')
+          if [ "$OPEN_PRS" -gt 0 ]; then
+            echo "a non-draft PR already exists for '$GITHUB_REF_NAME' — leaving status untouched"; exit 0
+          fi
+          # Project/field/option resolved by the shared project-lookup action.
+          # Belt-and-suspenders: currently unreachable (the token guard above
+          # exits first; with a token the action fails hard) — kept against
+          # future refactors that move the guards.
+          if [ "${PROJECT_LOOKUP:-}" != "ok" ]; then
+            echo "::error::project-lookup did not resolve"; exit 1
+          fi
+          PROJ="$PROJ_ID"; FIELD="$FIELD_ID"; OPTION="$OPTION_ID"
+          # RES (issue + projectItems, fetched above) carries each item's CURRENT
+          # Status (Status-scoped value); projectItems matching has no board paging
+          # and no cross-repo collisions.
+          ITEMS=$(jq -r --arg t "$PROJECT_TITLE" '
+            .data.repository.issue.projectItems.nodes[]?
+            | select(.project.title == $t)
+            | "\(.id)\t\([.fieldValues.nodes[]? | select(.field.name == "Status") | .name] | .[0] // "-")"' <<<"$RES")
+          # Symmetric merge-adjacent guard (cf. story-review): re-check the issue
+          # before ANY write — an in-flight run whose reads predate a merge must
+          # not write (or add a card) over story-done's fresh Done. gh --json state
+          # is uppercase OPEN (GraphQL-style), unlike webhook payloads.
+          ISSUE_STATE=$(gh issue view "$NUM" -R "$GITHUB_REPOSITORY" --json state -q .state)
+          if [ "$ISSUE_STATE" != "OPEN" ]; then
+            echo "issue #$NUM closed while this run was in flight — leaving the board to story-done"; exit 0
+          fi
+          if [ -n "$ITEMS" ]; then
+            # Status-based never-downgrade: if ANY card for this story sits at
+            # In review or Done (PR draft conversions, review lag), leave all alone
+            if awk -F'\t' '$2 == "In review" || $2 == "Done"' <<<"$ITEMS" | grep -q .; then
+              echo "issue #$NUM already has a card at In review/Done — not downgrading to $TARGET_STATUS"; exit 0
+            fi
+            # Ready gate: implementation starts only on human-promoted stories.
+            # A Backlog card has not been reviewed — require promotion first.
+            if awk -F'\t' '$2 == "Backlog"' <<<"$ITEMS" | grep -q .; then
+              echo "issue #$NUM is still at Backlog — review the story and promote it to Ready before implementation; card left at Backlog"; exit 0
+            fi
+          else
+            # Ready gate: no board card means the story was never human-promoted
+            echo "issue #$NUM has no board card — add it to the '$PROJECT_TITLE' board and promote it to Ready before implementation"; exit 0
+          fi
+          # Update every matching item (guards against historical double-adds)
+          while IFS=$'\t' read -r ITEM _CUR; do
+            [ -n "$ITEM" ] || continue
+            gql -f query='mutation($p: ID!, $i: ID!, $f: ID!, $o: String!){ updateProjectV2ItemFieldValue(input:{projectId:$p itemId:$i fieldId:$f value:{singleSelectOptionId:$o}}){ projectV2Item{ id } } }' -f p="$PROJ" -f i="$ITEM" -f f="$FIELD" -f o="$OPTION" > /dev/null
+            echo "✅ Story issue #$NUM → $TARGET_STATUS"
+          done <<<"$ITEMS"

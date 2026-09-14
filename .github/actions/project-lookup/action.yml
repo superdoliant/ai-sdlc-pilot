@@ -1,0 +1,87 @@
+name: Project lookup
+description: >-
+  Resolve the board project, its Status field, and the target option.
+  Exports PROJ_ID, FIELD_ID, OPTION_ID into the job environment for
+  subsequent steps. Single source of truth for the lookup that four
+  board workflows share (story #18, item 1).
+inputs:
+  gh-token:
+    description: >-
+      Token with project scope (plus repo read for the issue queries). May be
+      empty — the action then soft-skips and exports PROJECT_LOOKUP=skipped;
+      callers branch on the marker before using the exported ids.
+    required: false
+  owner:
+    description: Account owning the project
+    required: true
+  project-title:
+    description: Board title
+    required: true
+  status-field:
+    description: Single-select status field name
+    required: true
+  target-status:
+    description: Option to resolve (e.g. Backlog / In progress / In review / Done)
+    required: true
+runs:
+  using: composite
+  steps:
+    - name: Resolve project / field / option
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.gh-token }}
+        OWNER: ${{ inputs.owner }}
+        PROJECT_TITLE: ${{ inputs.project-title }}
+        STATUS_FIELD: ${{ inputs.status-field }}
+        TARGET_STATUS: ${{ inputs.target-status }}
+      run: |
+        set -euo pipefail
+        if [ -z "${GH_TOKEN:-}" ]; then
+          echo "::warning::project-lookup: no token provided — board workflow cannot resolve project/field/option; board writes below will skip"
+          echo "⚠️ project-lookup: no token provided — skipping"
+          echo "PROJECT_LOOKUP=skipped" >> "$GITHUB_ENV"
+          exit 0
+        fi
+        gql() {
+          local out
+          if ! out=$(gh api graphql "$@"); then
+            echo "::error::gh api graphql failed"; return 1
+          fi
+          if ! jq -e '(.errors // []) | length == 0' >/dev/null <<<"$out"; then
+            echo "::error::GraphQL errors: $(jq -c '.errors' <<<"$out")"; return 1
+          fi
+          printf '%s' "$out"
+        }
+        # Org-portable: organization() ERRORS (not nulls) for user logins, so
+        # probe it tolerantly first, then fall back to user()
+        META=$(gh api graphql -f query='
+          query($login: String!) {
+            organization(login: $login) {
+              projectsV2(first: 20) { nodes { id title fields(first: 30) { nodes { ... on ProjectV2SingleSelectField { name id options { id name } } } } } }
+            }
+          }' -f login="$OWNER" 2>/dev/null || true)
+        if ! jq -e --arg t "$PROJECT_TITLE" '[(.data.organization.projectsV2.nodes[]?) | select(.title == $t)] | length > 0' <<<"${META:-null}" >/dev/null 2>&1; then
+          META=$(gql -f query='
+            query($login: String!) {
+              user(login: $login) {
+                projectsV2(first: 20) { nodes { id title fields(first: 30) { nodes { ... on ProjectV2SingleSelectField { name id options { id name } } } } } }
+              }
+            }' -f login="$OWNER")
+        fi
+        PNODE=$(jq -c --arg t "$PROJECT_TITLE" '[(.data.organization.projectsV2.nodes[]?), (.data.user.projectsV2.nodes[]?)] | map(select(.title == $t)) | .[0] // empty' <<<"$META")
+        if [ -z "$PNODE" ]; then
+          echo "::error::project-lookup: project '$PROJECT_TITLE' not found for $OWNER"; exit 1
+        fi
+        PROJ=$(jq -r '.id' <<<"$PNODE")
+        FIELD=$(jq -r --arg f "$STATUS_FIELD" '.fields.nodes[]? | select(.name == $f) | .id' <<<"$PNODE")
+        OPTION=$(jq -r --arg f "$STATUS_FIELD" --arg o "$TARGET_STATUS" '.fields.nodes[]? | select(.name == $f) | .options[]? | select(.name == $o) | .id' <<<"$PNODE")
+        if [ -z "$FIELD" ] || [ "$FIELD" = "null" ] || [ -z "$OPTION" ] || [ "$OPTION" = "null" ]; then
+          echo "::error::project-lookup: field '$STATUS_FIELD' or option '$TARGET_STATUS' not found"; exit 1
+        fi
+        {
+          echo "PROJ_ID=$PROJ"
+          echo "FIELD_ID=$FIELD"
+          echo "OPTION_ID=$OPTION"
+          echo "PROJECT_LOOKUP=ok"
+        } >> "$GITHUB_ENV"
+        echo "✅ project-lookup: '$PROJECT_TITLE' / '$STATUS_FIELD' / '$TARGET_STATUS' resolved"

@@ -1,0 +1,100 @@
+name: Board add
+on:
+  issues:
+    # reopened: an issue labeled story while closed, then reopened, must still
+    # board at Backlog — otherwise it can never pass the Ready gate (NOT_ON_BOARD)
+    types: [opened, labeled, reopened]
+
+permissions:
+  contents: read
+
+# Story creation fires opened + labeled events concurrently (story-draft adds two
+# labels at once); serialize per-issue so the membership check can't race itself.
+concurrency:
+  group: board-add-${{ github.event.issue.number }}
+  cancel-in-progress: false
+
+env:
+  PROJECT_TITLE: ai-sdlc-pilot
+  STATUS_FIELD: Status
+  INITIAL_STATUS: Backlog
+
+jobs:
+  add-story-to-backlog:
+    # Only OPEN story issues belong on the board; label applied on creation or
+    # later. NOTE: webhook payload state is lowercase ("open"/"closed") — unlike
+    # the GraphQL IssueState enum — hence the != comparison.
+    if: contains(github.event.issue.labels.*.name, 'story') && github.event.issue.state != 'closed'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      # Deliberate: checkout + lookup run before the script's cheap guards —
+      # fail-loud on board misconfiguration beats silent skips (~10s per run).
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/project-lookup
+        with:
+          gh-token: ${{ secrets.PROJECT_TOKEN }}
+          owner: ${{ github.repository_owner }}
+          project-title: ${{ env.PROJECT_TITLE }}
+          status-field: ${{ env.STATUS_FIELD }}
+          target-status: ${{ env.INITIAL_STATUS }}
+      - name: Add story issue to board at Backlog
+        env:
+          GH_TOKEN: ${{ secrets.PROJECT_TOKEN }}
+          OWNER: ${{ github.repository_owner }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          ISSUE_NODE_ID: ${{ github.event.issue.node_id }}
+        run: |
+          set -euo pipefail
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "::warning::PROJECT_TOKEN secret not set — issue #$ISSUE_NUMBER NOT added to board; story stays unboarded (cannot pass the Ready gate)"
+            echo "⚠️ PROJECT_TOKEN secret not set — issue #$ISSUE_NUMBER not added to board"; exit 0
+          fi
+          gql() {
+            local out
+            if ! out=$(gh api graphql "$@"); then
+              echo "::error::gh api graphql failed"; return 1
+            fi
+            if ! jq -e '(.errors // []) | length == 0' >/dev/null <<<"$out"; then
+              echo "::error::GraphQL errors: $(jq -c '.errors' <<<"$out")"; return 1
+            fi
+            printf '%s' "$out"
+          }
+          # Project/field/option resolved by the shared project-lookup action.
+          # Belt-and-suspenders: currently unreachable (the token guard above
+          # exits first; with a token the action fails hard) — kept against
+          # future refactors that move the guards.
+          if [ "${PROJECT_LOOKUP:-}" != "ok" ]; then
+            echo "::error::project-lookup did not resolve"; exit 1
+          fi
+          PROJ="$PROJ_ID"; FIELD="$FIELD_ID"; OPTION="$OPTION_ID"
+          # Idempotency: walk ALL pages of board items (single query, nullable cursor)
+          # — never re-add (and never reset Status on) an issue that's already there.
+          # Membership is matched by issue number AND repository.
+          ON_BOARD=""
+          CURSOR=""
+          while :; do
+            PAGE=$(gql -f query='
+              query($id: ID!, $c: String) {
+                node(id: $id) {
+                  ... on ProjectV2 {
+                    items(first: 100, after: $c) {
+                      pageInfo { hasNextPage endCursor }
+                      nodes { content { ... on Issue { number repository { nameWithOwner } } } }
+                    }
+                  }
+                }
+              }' -f id="$PROJ" -F c="${CURSOR:-null}")
+            if jq -e --argjson n "$ISSUE_NUMBER" --arg repo "$GITHUB_REPOSITORY" '.data.node.items.nodes[]? | select((.content.number? // -1) == $n and (.content.repository.nameWithOwner? // "") == $repo)' <<<"$PAGE" > /dev/null; then
+              ON_BOARD=yes; break
+            fi
+            if [ "$(jq -r '.data.node.items.pageInfo.hasNextPage' <<<"$PAGE")" != "true" ]; then break; fi
+            CURSOR=$(jq -r '.data.node.items.pageInfo.endCursor' <<<"$PAGE")
+          done
+          if [ "$ON_BOARD" = "yes" ]; then
+            echo "issue #$ISSUE_NUMBER already on the board — nothing to do"; exit 0
+          fi
+          # Node id comes from the event payload — no gh issue view call, no extra scope
+          ITEM=$(gql -f query='mutation($p: ID!, $c: ID!){ addProjectV2ItemById(input:{projectId:$p contentId:$c}){ item{ id } } }' -f p="$PROJ" -f c="$ISSUE_NODE_ID" | jq -r '.data.addProjectV2ItemById.item.id')
+          gql -f query='mutation($p: ID!, $i: ID!, $f: ID!, $o: String!){ updateProjectV2ItemFieldValue(input:{projectId:$p itemId:$i fieldId:$f value:{singleSelectOptionId:$o}}){ projectV2Item{ id } } }' -f p="$PROJ" -f i="$ITEM" -f f="$FIELD" -f o="$OPTION" > /dev/null
+          echo "✅ Issue #$ISSUE_NUMBER added to '$PROJECT_TITLE' at $INITIAL_STATUS"

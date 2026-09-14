@@ -1,0 +1,164 @@
+name: Story done
+on:
+  pull_request:
+    types: [closed]
+
+permissions:
+  contents: read
+
+# Global serialization, scoped by merge outcome: per-issue grouping is impossible
+# from PR events, and two same-window merges would double-add an unboarded card.
+# Grouping by `merged` matters because the group applies BEFORE the job-level if —
+# a non-merge close queued in the same group would otherwise cancel a pending
+# merge run and then skip instantly, never reaching the heal sweep.
+concurrency:
+  group: story-done-board-${{ github.event.pull_request.merged }}
+  cancel-in-progress: false
+
+env:
+  PROJECT_TITLE: ai-sdlc-pilot
+  STATUS_FIELD: Status
+  TARGET_STATUS: Done
+
+jobs:
+  set-done:
+    # Only actual merges of same-repo PRs into the default branch — non-default
+    # merges don't auto-close the issue, so Done there would be premature terminal
+    if: >-
+      github.event.pull_request.merged == true &&
+      github.event.pull_request.base.ref == 'main' &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      # Deliberate: checkout + lookup run before the script's cheap guards —
+      # fail-loud on board misconfiguration beats silent skips (~10s per run).
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/project-lookup
+        with:
+          gh-token: ${{ secrets.PROJECT_TOKEN }}
+          owner: ${{ github.repository_owner }}
+          project-title: ${{ env.PROJECT_TITLE }}
+          status-field: ${{ env.STATUS_FIELD }}
+          target-status: ${{ env.TARGET_STATUS }}
+      - name: Move story items closed by this PR to Done
+        env:
+          GH_TOKEN: ${{ secrets.PROJECT_TOKEN }}
+          OWNER: ${{ github.repository_owner }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "::warning::PROJECT_TOKEN secret not set — no Done moves for PR #$PR_NUMBER; card stays below Done"
+            echo "⚠️ PROJECT_TOKEN secret not set — no Done moves for PR #$PR_NUMBER"; exit 0
+          fi
+          REPO_NAME="${GITHUB_REPOSITORY#*/}"
+          gql() {
+            local out
+            if ! out=$(gh api graphql "$@"); then
+              echo "::error::gh api graphql failed"; return 1
+            fi
+            if ! jq -e '(.errors // []) | length == 0' >/dev/null <<<"$out"; then
+              echo "::error::GraphQL errors: $(jq -c '.errors' <<<"$out")"; return 1
+            fi
+            printf '%s' "$out"
+          }
+          # Closing references resolved by GitHub — includes follow-up PRs that
+          # "Closes #N" an already-closed story (the healing case the built-in
+          # handles slowly or not at all)
+          RES=$(gql -F n="$PR_NUMBER" -f query='
+            query($o: String!, $r: String!, $n: Int!) {
+              repository(owner: $o, name: $r) {
+                pullRequest(number: $n) {
+                  closingIssuesReferences(first: 20) {
+                    nodes {
+                      number state id
+                      repository { nameWithOwner }
+                      labels(first: 50) { nodes { name } }
+                      projectItems(first: 50) { nodes { id project { title } } }
+                    }
+                  }
+                }
+              }
+            }' -f o="$OWNER" -f r="$REPO_NAME")
+          COUNT=$(jq -r '.data.repository.pullRequest.closingIssuesReferences.nodes | length' <<<"$RES")
+          if [ -z "$COUNT" ] || [ "$COUNT" = "null" ] || [ "$COUNT" = "0" ]; then
+            # Do NOT exit — the heal sweep below must still run: a superseded
+            # sibling run's closed stories are healed precisely in these rare
+            # windows (the main loop simply iterates zero times)
+            echo "PR #$PR_NUMBER closes no issues — main loop skipped; heal sweep still runs"
+          fi
+          # Project/field/option resolved by the shared project-lookup action.
+          # Belt-and-suspenders: currently unreachable (the token guard above
+          # exits first; with a token the action fails hard) — kept against
+          # future refactors that move the guards.
+          if [ "${PROJECT_LOOKUP:-}" != "ok" ]; then
+            echo "::error::project-lookup did not resolve"; exit 1
+          fi
+          PROJ="$PROJ_ID"; FIELD="$FIELD_ID"; OPTION="$OPTION_ID"
+          MOVED=0
+          # Story-labeled closing refs from THIS repo, in ANY issue state — Done is
+          # terminal and idempotent, so this both completes normal merges and heals
+          # follow-up merges to already-closed stories
+          while IFS= read -r ISSUE; do
+            NUM=$(jq -r '.number' <<<"$ISSUE")
+            ITEMS=$(jq -r --arg t "$PROJECT_TITLE" '.projectItems.nodes[]? | select(.project.title == $t) | .id' <<<"$ISSUE")
+            if [ -z "$ITEMS" ] || [ "$ITEMS" = "null" ]; then
+              CONTENT=$(jq -r '.id' <<<"$ISSUE")
+              ITEMS=$(gql -f query='mutation($p: ID!, $c: ID!){ addProjectV2ItemById(input:{projectId:$p contentId:$c}){ item{ id } } }' -f p="$PROJ" -f c="$CONTENT" | jq -r '.data.addProjectV2ItemById.item.id')
+              echo "⚠️ issue #$NUM was not on the board — added directly at $TARGET_STATUS (no lifecycle trail)"
+            fi
+            # Update every matching item — a multi-line id fed to one mutation
+            # would fail the run that owns the terminal transition
+            while IFS= read -r ITEM; do
+              [ -n "$ITEM" ] || continue
+              gql -f query='mutation($p: ID!, $i: ID!, $f: ID!, $o: String!){ updateProjectV2ItemFieldValue(input:{projectId:$p itemId:$i fieldId:$f value:{singleSelectOptionId:$o}}){ projectV2Item{ id } } }' -f p="$PROJ" -f i="$ITEM" -f f="$FIELD" -f o="$OPTION" > /dev/null
+            done <<<"$ITEMS"
+            echo "✅ issue #$NUM → $TARGET_STATUS (PR #$PR_NUMBER merged)"
+            MOVED=1
+          done < <(jq -c --arg repo "$GITHUB_REPOSITORY" '.data.repository.pullRequest.closingIssuesReferences.nodes[]
+                          | select(.repository.nameWithOwner == $repo)
+                          | select(any(.labels.nodes[].name; . == "story"))' <<<"$RES")
+          if [ "$MOVED" != "1" ]; then echo "main loop moved nothing (closing refs were non-story, cross-repo, or absent)"; fi
+          # Heal sweep (closes the concurrency-group drop window): a superseded
+          # pending run can be CANCELLED (grey, not red), leaving its closed
+          # issues' cards below Done with no other healer. Every surviving run
+          # therefore also repairs: any board item whose issue is CLOSED+COMPLETED
+          # from this repo and not yet Done goes to Done. Policy, not just race
+          # recovery: closed-as-completed means Done however it closed — including
+          # maintainer closes without any PR merge (see CLAUDE.md lifecycle).
+          # Idempotent and terminal.
+          # Scope: repairs CARDED stories only — an unboarded closed+completed
+          # story (cancelled run + never boarded) is a documented residual, #25.
+          HEAL_CURSOR=""
+          while :; do
+            HPAGE=$(gql -f query='
+              query($id: ID!, $c: String) {
+                node(id: $id) { ... on ProjectV2 {
+                  items(first: 100, after: $c) {
+                    pageInfo { hasNextPage endCursor }
+                    nodes {
+                      id
+                      fieldValues(first: 10) { nodes { ... on ProjectV2ItemFieldSingleSelectValue { name field { ... on ProjectV2SingleSelectField { name } } } } }
+                      content { ... on Issue { number state stateReason labels(first: 50) { nodes { name } } repository { nameWithOwner } } }
+                    }
+                  }
+                } }
+              }' -f id="$PROJ" -F c="${HEAL_CURSOR:-null}")
+            while IFS=$'\t' read -r HID HNUM; do
+              [ -n "$HID" ] || continue
+              # Merge-adjacent re-check (repo idiom, cf. story-status/story-review):
+              # the page walk's state read may be stale — an issue reopened inside
+              # the window must not be force-moved to terminal Done
+              if [ "$(gh issue view "$HNUM" -R "$GITHUB_REPOSITORY" --json state,stateReason -q '"\(.state)/\(.stateReason // "")"')" != "CLOSED/COMPLETED" ]; then
+                echo "skip heal: issue #$HNUM is no longer CLOSED/COMPLETED"; continue
+              fi
+              gql -f query='mutation($p: ID!, $i: ID!, $f: ID!, $o: String!){ updateProjectV2ItemFieldValue(input:{projectId:$p itemId:$i fieldId:$f value:{singleSelectOptionId:$o}}){ projectV2Item{ id } } }' -f p="$PROJ" -f i="$HID" -f f="$FIELD" -f o="$OPTION" > /dev/null
+              echo "🩹 heal: closed story's card → $TARGET_STATUS (closed-as-completed ⇒ Done: policy + race recovery)"
+            # Filter lives in scripts/heal-filter.jq and is pinned by the
+            # conventions CI job against scripts/heal-filter.fixture.json —
+            # the round-4 🔴 (silent no-op filter) must not be re-shippable
+            done < <(jq -r --arg repo "$GITHUB_REPOSITORY" --arg f "$STATUS_FIELD" --arg done "$TARGET_STATUS" -f scripts/heal-filter.jq <<<"$HPAGE")
+            if [ "$(jq -r '.data.node.items.pageInfo.hasNextPage' <<<"$HPAGE")" != "true" ]; then break; fi
+            HEAL_CURSOR=$(jq -r '.data.node.items.pageInfo.endCursor' <<<"$HPAGE")
+          done

@@ -1,0 +1,120 @@
+name: AI Review
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: ai-review-${{ github.event.pull_request.number || github.event.issue.number }}
+  cancel-in-progress: true
+
+jobs:
+  review:
+    if: >-
+      (github.event_name == 'pull_request' &&
+       github.event.pull_request.head.repo.full_name == github.repository) ||
+      (github.event_name == 'issue_comment' &&
+       github.event.issue.pull_request &&
+       contains(github.event.comment.body, '@claude') &&
+       (github.event.comment.author_association == 'OWNER' ||
+        github.event.comment.author_association == 'MEMBER' ||
+        github.event.comment.author_association == 'COLLABORATOR'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      GH_TOKEN: ${{ github.token }}
+      PR_NUMBER: ${{ github.event.pull_request.number || github.event.issue.number }}
+      COMMENT_BODY: ${{ github.event.comment.body }}
+      OWNER: ${{ github.repository_owner }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with: { node-version: 20 }
+
+      - run: npm install -g @anthropic-ai/claude-code
+
+      - name: Trust workspace for Claude Code
+        env:
+          WS: ${{ github.workspace }}
+        run: printf '{"projects":{"%s":{"hasTrustDialogAccepted":true}}}' "$WS" > "$HOME/.claude.json"
+
+      - name: Check if PR references a story issue
+        run: |
+          set -euo pipefail
+          BODY=$(gh pr view "$PR_NUMBER" --json body -q .body)
+          # Must match the closing-keyword pattern (Closes #N, Fixes #N, etc.)
+          if echo "$BODY" | grep -qiE '(^|[^a-z])(close[sd]?|fix(e[sd])?|resolve[sd]?)[[:space:]]*:?[[:space:]]+#[0-9]+'; then
+            echo "✅ PR references a story issue — proceeding with AI review"
+          else
+            echo "⚠️ PR does not reference a story issue (no 'Closes #N' in body) — skipping AI review"
+            echo "AI review skipped: PR not connected to a story issue" > review.md
+            exit 0
+          fi
+
+      - name: Fork guard
+        run: |
+          set -euo pipefail
+          HEAD_OWNER=$(gh pr view "$PR_NUMBER" --json headRepositoryOwner -q .headRepositoryOwner.login)
+          if [ "$HEAD_OWNER" != "$OWNER" ]; then
+            echo "⚠️ PR #$PR_NUMBER originates from fork $HEAD_OWNER — refusing to run the agent on untrusted content." > review.md
+            exit 0
+          fi
+          echo "✅ PR #$PR_NUMBER is from the main repo — proceeding with review"
+
+      - name: Build the review prompt
+        run: |
+          set -euo pipefail
+          if [ -n "${COMMENT_BODY:-}" ]; then
+            { echo "A reviewer requested the following on PR #$PR_NUMBER:"; echo; \
+              echo "$COMMENT_BODY"; echo; \
+              echo "Follow .claude/prompts/pr-review.md, plus this specific request."; } > prompt.txt
+          else
+            echo "Review pull request #$PR_NUMBER. Read .claude/prompts/pr-review.md and follow it exactly. Inspect the diff and surrounding code with the provided tools. Write the final markdown review to stdout." > prompt.txt
+          fi
+
+      - name: Run AI review
+        env:
+          ANTHROPIC_BASE_URL: ${{ secrets.ANTHROPIC_BASE_URL }}
+          ANTHROPIC_AUTH_TOKEN: ${{ secrets.ANTHROPIC_AUTH_TOKEN }}
+          ANTHROPIC_DEFAULT_SONNET_MODEL: ${{ secrets.ANTHROPIC_DEFAULT_SONNET_MODEL }}
+          ANTHROPIC_DEFAULT_HAIKU_MODEL: ${{ secrets.ANTHROPIC_DEFAULT_HAIKU_MODEL }}
+          ANTHROPIC_DEFAULT_OPUS_MODEL: ${{ secrets.ANTHROPIC_DEFAULT_OPUS_MODEL }}
+        run: |
+          set -euo pipefail
+          [ -f review.md ] && exit 0
+          if [ -z "${ANTHROPIC_AUTH_TOKEN:-}" ]; then
+            echo "::warning::AI review skipped: ANTHROPIC_AUTH_TOKEN secret not set — AI-review gate OPEN (no review comments will be posted)"
+            echo "⚠️ AI review skipped: ANTHROPIC_AUTH_TOKEN secret not set" > review.md
+            exit 0
+          fi
+          # Tool grants mirror scripts/ai-review.sh exactly — the check-ai-review-tools
+          # Makefile guard fails lint/CI if they drift (the #32 class: a wide
+          # "Bash(gh pr *)" allowlist with no write-denials). --settings isolates
+          # the review session from dev-session grants in .claude/settings.json.
+          claude -p "$(cat prompt.txt)" \
+            --settings "$GITHUB_WORKSPACE/.claude/settings.review.json" \
+            --allowedTools "Read" "Grep" "Glob" \
+            "Bash(gh pr diff *)" "Bash(gh pr view *)" "Bash(gh issue view *)" \
+            "Bash(git log *)" "Bash(git show *)" \
+            --disallowedTools "Bash(gh pr comment *)" "Bash(gh pr edit *)" "Bash(gh pr merge *)" \
+            "Bash(gh pr create *)" "Bash(gh pr close *)" "Bash(gh pr ready *)" "Bash(gh pr review *)" \
+            "Bash(gh issue comment *)" "Bash(gh issue edit *)" "Bash(gh issue create *)" \
+            "Bash(gh issue delete *)" "Bash(gh issue develop *)" "Bash(gh issue transfer *)" \
+            "Bash(gh issue reopen *)" "Bash(gh issue lock *)" "Bash(gh issue unlock *)" \
+            "Bash(gh issue pin *)" "Bash(gh issue unpin *)" \
+            "Bash(gh issue add-sub-issue *)" "Bash(gh issue remove-sub-issue *)" \
+            --max-turns 30 > review.md
+
+      - name: Post review comment
+        run: |
+          if [ -s review.md ]; then
+            gh pr comment "$PR_NUMBER" --body-file review.md
+          fi

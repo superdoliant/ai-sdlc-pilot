@@ -1,0 +1,16 @@
+.DS_Store
+node_modules/
+.env
+.env.*
+*.log
+/tmp
+
+# IDE folders
+.idea/
+.vscode/
+*.iml
+
+# Node.js / React
+dist/
+build/
+coverage/

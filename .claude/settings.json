@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(gh issue *)",
+      "Bash(gh label list*)",
+      "Bash(git diff*)",
+      "Bash(git log*)"
+    ],
+    "deny": [
+      "Bash(gh repo delete*)",
+      "Bash(gh issue close*)",
+      "Bash(git push --force*)",
+      "Read(.env*)"
+    ]
+  }
+}

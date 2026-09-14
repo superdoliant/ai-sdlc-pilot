@@ -1,0 +1,18 @@
+{
+  "data": {
+    "node": {
+      "items": {
+        "nodes": [
+          {"id": "HEAL_THIS", "fieldValues": {"nodes": [{"name": "In review", "field": {"name": "Status"}}]}, "content": {"number": 42, "state": "CLOSED", "stateReason": "COMPLETED", "labels": {"nodes": [{"name": "story"}]}, "repository": {"nameWithOwner": "test-owner/test-repo"}}},
+          {"id": "WRONG_LABEL", "fieldValues": {"nodes": [{"name": "In review", "field": {"name": "Status"}}]}, "content": {"number": 43, "state": "CLOSED", "stateReason": "COMPLETED", "labels": {"nodes": [{"name": "bug"}]}, "repository": {"nameWithOwner": "test-owner/test-repo"}}},
+          {"id": "WRONG_REASON", "fieldValues": {"nodes": [{"name": "In review", "field": {"name": "Status"}}]}, "content": {"number": 44, "state": "CLOSED", "stateReason": "NOT_PLANNED", "labels": {"nodes": [{"name": "story"}]}, "repository": {"nameWithOwner": "test-owner/test-repo"}}},
+          {"id": "ALREADY_DONE", "fieldValues": {"nodes": [{"name": "Done", "field": {"name": "Status"}}]}, "content": {"number": 45, "state": "CLOSED", "stateReason": "COMPLETED", "labels": {"nodes": [{"name": "story"}]}, "repository": {"nameWithOwner": "test-owner/test-repo"}}},
+          {"id": "STILL_OPEN", "fieldValues": {"nodes": [{"name": "In review", "field": {"name": "Status"}}]}, "content": {"number": 46, "state": "OPEN", "stateReason": "REOPENED", "labels": {"nodes": [{"name": "story"}]}, "repository": {"nameWithOwner": "test-owner/test-repo"}}},
+          {"id": "FOREIGN_REPO", "fieldValues": {"nodes": [{"name": "In review", "field": {"name": "Status"}}]}, "content": {"number": 47, "state": "CLOSED", "stateReason": "COMPLETED", "labels": {"nodes": [{"name": "story"}]}, "repository": {"nameWithOwner": "other/repo"}}},
+          {"id": "NO_STATUS", "fieldValues": {"nodes": []}, "content": {"number": 48, "state": "CLOSED", "stateReason": "COMPLETED", "labels": {"nodes": [{"name": "story"}]}, "repository": {"nameWithOwner": "test-owner/test-repo"}}},
+          {"id": "PR_ITEM", "fieldValues": {"nodes": []}, "content": {}}
+        ]
+      }
+    }
+  }
+}

@@ -1,0 +1,9 @@
+repos:
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.24.0
+    hooks:
+      - id: gitleaks
+  # Once the codebase lands, consider adding:
+  # - Java:  spotless / checkstyle via Maven (enforced by `make lint`)
+  # - Dart:  `flutter format` or dart-format hook
+  # - YAML:  pre-commit/mirrors-prettier

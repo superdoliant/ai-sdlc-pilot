@@ -1,0 +1,16 @@
+name: Story brief
+description: Raw brief — AI will expand it into a full story draft
+labels: [story, ai-draft, needs-expansion]
+body:
+  - type: textarea
+    id: brief
+    attributes:
+      label: Feature brief
+      description: The problem or opportunity, in plain language
+    validations:
+      required: true
+  - type: textarea
+    id: context
+    attributes:
+      label: Constraints / context
+      description: Deadlines, dependencies, must-nots

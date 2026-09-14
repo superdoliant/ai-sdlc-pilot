@@ -1,0 +1,120 @@
+name: Story review
+on:
+  pull_request:
+    types: [opened, reopened, ready_for_review, edited]
+
+permissions:
+  contents: read
+
+env:
+  PROJECT_TITLE: ai-sdlc-pilot
+  STATUS_FIELD: Status
+  TARGET_STATUS: In review
+
+jobs:
+  set-in-review:
+    # Only non-draft, same-repo PRs; for edited PRs, only when the body changed
+    if: >-
+      github.event.pull_request.draft == false &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      (github.event_name != 'edited' || github.event.changes.body != null)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      # Deliberate: checkout + lookup run before the script's cheap guards —
+      # fail-loud on board misconfiguration beats silent skips (~10s per run).
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/project-lookup
+        with:
+          gh-token: ${{ secrets.PROJECT_TOKEN }}
+          owner: ${{ github.repository_owner }}
+          project-title: ${{ env.PROJECT_TITLE }}
+          status-field: ${{ env.STATUS_FIELD }}
+          target-status: ${{ env.TARGET_STATUS }}
+      - name: Move story items closed by this PR to In review
+        env:
+          GH_TOKEN: ${{ secrets.PROJECT_TOKEN }}
+          OWNER: ${{ github.repository_owner }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "::warning::PROJECT_TOKEN secret not set — no In-review moves for PR #$PR_NUMBER; card stays where it is"
+            echo "⚠️ PROJECT_TOKEN secret not set — no In-review moves for PR #$PR_NUMBER"; exit 0
+          fi
+          REPO_NAME="${GITHUB_REPOSITORY#*/}"
+          gql() {
+            local out
+            if ! out=$(gh api graphql "$@"); then
+              echo "::error::gh api graphql failed"; return 1
+            fi
+            if ! jq -e '(.errors // []) | length == 0' >/dev/null <<<"$out"; then
+              echo "::error::GraphQL errors: $(jq -c '.errors' <<<"$out")"; return 1
+            fi
+            printf '%s' "$out"
+          }
+          # Closing references only — resolved by GitHub from closing keywords, so:
+          # no body text parsing (nothing to crash on empty bodies), no mere-mention
+          # moves. Repo scoping is enforced below (cross-repo closing refs exist).
+          RES=$(gql -F n="$PR_NUMBER" -f query='
+            query($o: String!, $r: String!, $n: Int!) {
+              repository(owner: $o, name: $r) {
+                pullRequest(number: $n) {
+                  closingIssuesReferences(first: 20) {
+                    nodes {
+                      number state id
+                      repository { nameWithOwner }
+                      labels(first: 50) { nodes { name } }
+                      projectItems(first: 50) { nodes { id project { title } fieldValues(first: 10) { nodes { ... on ProjectV2ItemFieldSingleSelectValue { name field { ... on ProjectV2SingleSelectField { name } } } } } } }
+                    }
+                  }
+                }
+              }
+            }' -f o="$OWNER" -f r="$REPO_NAME")
+          COUNT=$(jq -r '.data.repository.pullRequest.closingIssuesReferences.nodes | length' <<<"$RES")
+          if [ -z "$COUNT" ] || [ "$COUNT" = "null" ] || [ "$COUNT" = "0" ]; then
+            echo "PR #$PR_NUMBER closes no issues — skipping"; exit 0
+          fi
+          # Project/field/option resolved by the shared project-lookup action.
+          # Belt-and-suspenders: currently unreachable (the token guard above
+          # exits first; with a token the action fails hard) — kept against
+          # future refactors that move the guards.
+          if [ "${PROJECT_LOOKUP:-}" != "ok" ]; then
+            echo "::error::project-lookup did not resolve"; exit 1
+          fi
+          PROJ="$PROJ_ID"; FIELD="$FIELD_ID"; OPTION="$OPTION_ID"
+          # Merge-adjacent guard: if this PR closed between the triggering event
+          # and now, story-done owns the card — writing In review over a fresh
+          # Done would recreate the #16 end state through a race
+          PR_STATE=$(gh pr view "$PR_NUMBER" -R "$GITHUB_REPOSITORY" --json state -q .state)
+          if [ "$PR_STATE" != "OPEN" ]; then
+            echo "PR #$PR_NUMBER is no longer open (state: $PR_STATE) — leaving the board to story-done"; exit 0
+          fi
+          MOVED=0
+          # Only OPEN, story-labeled issues FROM THIS REPO: cross-repo closing refs,
+          # non-story issues, and closed issues never touch this board.
+          while IFS= read -r ISSUE; do
+            NUM=$(jq -r '.number' <<<"$ISSUE")
+            ITEMS=$(jq -r --arg t "$PROJECT_TITLE" '.projectItems.nodes[]? | select(.project.title == $t) | "\(.id)\t\([.fieldValues.nodes[]? | select(.field.name == "Status") | .name] | .[0] // "-")"' <<<"$ISSUE")
+            if [ -z "$ITEMS" ] || [ "$ITEMS" = "null" ]; then
+              CONTENT=$(jq -r '.id' <<<"$ISSUE")
+              ITEMS=$(gql -f query='mutation($p: ID!, $c: ID!){ addProjectV2ItemById(input:{projectId:$p contentId:$c}){ item{ id } } }' -f p="$PROJ" -f c="$CONTENT" | jq -r '.data.addProjectV2ItemById.item.id + "\t-"')
+            fi
+            # Ready gate: a Backlog card was never human-promoted — opening a PR
+            # does not bypass the gate
+            if awk -F'\t' '$2 == "Backlog"' <<<"$ITEMS" | grep -q .; then
+              echo "issue #$NUM is still at Backlog — not moving to $TARGET_STATUS; promote it to Ready first"; continue
+            fi
+            # Update every matching item — a multi-line id fed to one mutation
+            # would fail the run (same class as story-done review finding 1)
+            while IFS=$'\t' read -r ITEM _CUR; do
+              [ -n "$ITEM" ] || continue
+              gql -f query='mutation($p: ID!, $i: ID!, $f: ID!, $o: String!){ updateProjectV2ItemFieldValue(input:{projectId:$p itemId:$i fieldId:$f value:{singleSelectOptionId:$o}}){ projectV2Item{ id } } }' -f p="$PROJ" -f i="$ITEM" -f f="$FIELD" -f o="$OPTION" > /dev/null
+            done <<<"$ITEMS"
+            echo "✅ issue #$NUM → $TARGET_STATUS (PR #$PR_NUMBER)"
+            MOVED=1
+          done < <(jq -c --arg repo "$GITHUB_REPOSITORY" '.data.repository.pullRequest.closingIssuesReferences.nodes[]
+                          | select(.state == "OPEN")
+                          | select(.repository.nameWithOwner == $repo)
+                          | select(any(.labels.nodes[].name; . == "story"))' <<<"$RES")
+          if [ "$MOVED" != "1" ]; then echo "no open story issues from this repo closed by this PR — board unchanged"; fi

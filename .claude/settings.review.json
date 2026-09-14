@@ -1,0 +1,39 @@
+{
+  "permissions": {
+    "allow": [
+      "Read",
+      "Grep",
+      "Glob",
+      "Bash(gh pr diff *)",
+      "Bash(gh pr view *)",
+      "Bash(gh issue view *)",
+      "Bash(git log *)",
+      "Bash(git show *)"
+    ],
+    "deny": [
+      "Bash(gh pr comment *)",
+      "Bash(gh pr edit *)",
+      "Bash(gh pr merge *)",
+      "Bash(gh pr create *)",
+      "Bash(gh pr close *)",
+      "Bash(gh pr ready *)",
+      "Bash(gh pr review *)",
+      "Bash(gh issue comment *)",
+      "Bash(gh issue edit *)",
+      "Bash(gh issue create *)",
+      "Bash(gh issue delete *)",
+      "Bash(gh issue develop *)",
+      "Bash(gh issue transfer *)",
+      "Bash(gh issue reopen *)",
+      "Bash(gh issue lock *)",
+      "Bash(gh issue unlock *)",
+      "Bash(gh issue pin *)",
+      "Bash(gh issue unpin *)",
+      "Bash(gh issue add-sub-issue *)",
+      "Bash(gh issue remove-sub-issue *)",
+      "Bash(gh repo delete *)",
+      "Bash(git push --force*)",
+      "Read(.env*)"
+    ]
+  }
+}
