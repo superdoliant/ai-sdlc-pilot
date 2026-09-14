@@ -53,8 +53,6 @@ unmodified.
 
 ## Open item carried from the story
 
-The story's own Open Questions (exact definition of "empty," and the rationale for
-discarding the current README) are unresolved. This plan assumes the reviewer resolves
-them during card review; if the resolution changes the acceptance criteria materially
-(e.g., zero-byte vs. heading-only), the traceability table's first row should be
-re-checked against whichever definition is confirmed.
+Resolved during PR #2 review: "empty" means heading-only (`README.md` contains just
+`# ai-sdlc-pilot`), confirmed by the human reviewer and recorded as a comment on
+issue #1. The traceability table's first row reflects this definition.
